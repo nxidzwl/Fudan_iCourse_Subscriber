@@ -95,7 +95,7 @@ def _build_plain(course_title: str, teacher: str, lectures: list[dict]) -> str:
         # parts.append(f"\n{'─' * 40}")
         parts.append(f"## {lec['sub_title']} ({lec['date']})")
         # parts.append("─" * 40)
-        # parts.append(lec["summary"])
+        parts.append(lec["summary"])
     return "\n".join(parts)
 
 
