@@ -165,7 +165,7 @@ def clean_ppt_text(text: str) -> str:
             continue
         # ≤2 char lines are virtually always UI chrome (ribbon icons, IME
         # indicators, single letters from Alt-key shortcuts, etc.).
-        if len(s) <= 2:
+        if len(s) <= 1:
             continue
         # Normalise away the full-width ideographic space (U+3000) that
         # PowerPoint uses in its ribbon layout, and repeated spaces.
