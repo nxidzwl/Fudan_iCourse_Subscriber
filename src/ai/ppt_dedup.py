@@ -1,20 +1,22 @@
 """PPT page filters: perceptual-hash dedup + multi-pattern invalid-page match.
 
-Two stages, both run from main.py's _fetch_and_ocr_ppts:
+All configurable rules live in ``ppt_dedup_config.py`` — edit that file to
+tune patterns without touching this logic code.
 
-1. ``dedup_dhash`` operates on dhashes computed from the raw image bytes
-   (cheap, no OCR needed) and drops near-duplicate frames using a sliding
-   window. The iCourse capture pipeline takes timed screenshots, so a
-   classroom that stays on one slide for several minutes produces dozens
-   of identical frames; collapsing them before OCR saves both time and
-   prompt budget.
+Pipeline (both stages run from main.py's ``_fetch_and_ocr_ppts``):
 
-2. ``is_invalid_page`` runs after OCR and matches the recovered text
-   against a list of feature substrings extracted from the two known
-   classroom-noise screens (the desktop wallpaper and the e-learning
-   resource portal). Patterns are deliberately long and topic-specific
-   so they don't false-positive on real slides; punctuation and
-   whitespace are stripped before matching to tolerate OCR noise.
+1. ``compute_dhash`` / ``dedup_dhash`` — pre-OCR, drops near-duplicate
+   frames using perceptual hashing so the OCR pass runs on fewer images.
+
+2. ``is_invalid_page`` — post-OCR, discards pages whose text matches known
+   full-screen noise (desktop wallpaper, e-learning portal, file explorer, etc.)
+
+3. ``clean_ppt_text`` — post-invalidation, strips per-line UI chrome labels
+   (PowerPoint ribbon, IDE panels, system dialogs, etc.) from surviving pages.
+
+4. ``dedup_text_subset`` — post-cleaning, removes pages whose text is a
+   near-subset of a nearby page (PPT animation reveals, progressive bullet
+   disclosure).
 """
 
 from __future__ import annotations
@@ -22,8 +24,31 @@ from __future__ import annotations
 import io
 import re
 from typing import Iterable
+
 import imagehash
 from PIL import Image
+
+from src.ai.ppt_dedup_config import (
+    DHASH_THRESHOLD,
+    DHASH_WINDOW,
+    INVALID_PAGE_PATTERNS,
+    PPT_UI_STOPWORDS,
+    SUBSET_CONFIG,
+    UI_NOISE_LINE_PATTERNS,
+)
+
+# ── Compile regexes from config once at import time ─────────────────────────
+_UI_NOISE_LINE_RES: list[re.Pattern] = [
+    re.compile(p) for p in UI_NOISE_LINE_PATTERNS
+]
+
+_NORMALIZE_RE = re.compile(r"[\W_]+", re.UNICODE)
+_NORMALIZE_UI_RE = re.compile(r"[\s　]+")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 1 — PHASH dedup  (pre-OCR)
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def compute_dhash(image_bytes: bytes) -> str | None:
@@ -35,7 +60,6 @@ def compute_dhash(image_bytes: bytes) -> str | None:
     decode failure, missing PIL, etc.) — those pages are excluded from
     the dedup pass and pass through to OCR untouched.
     """
-
     try:
         with Image.open(io.BytesIO(image_bytes)) as img:
             return str(imagehash.dhash(img))
@@ -44,31 +68,29 @@ def compute_dhash(image_bytes: bytes) -> str | None:
 
 
 def _hamming_hex(a: str, b: str) -> int:
-    """Bit-count XOR of two equal-length hex strings."""
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
 def dedup_dhash(
     items: list[str | None],
-    window: int = 10,
-    threshold: int = 2,
+    window: int = DHASH_WINDOW,
+    threshold: int = DHASH_THRESHOLD,
 ) -> list[int]:
     """Sliding-window perceptual dedup. Returns sorted list of dropped indices.
 
-    For each surviving anchor i, scan forward collecting at most
-    ``window`` *non-dropped* items to compare against.  When the scan
-    finds a match the matched index is dropped and the window
-    automatically "fills forward" (the dropped slot is replaced by the
-    next non-dropped item beyond the current window boundary).  This
-    makes the dedup more aggressive than a fixed-position window since
-    dropped items don't reduce the number of actual comparisons.
+    For each surviving anchor i, scan forward collecting at most ``window``
+    *non-dropped* items to compare against.  When the scan finds a match the
+    matched index is dropped and the window automatically "fills forward" (the
+    dropped slot is replaced by the next non-dropped item beyond the current
+    window boundary).  This makes the dedup more aggressive than a fixed-position
+    window since dropped items don't reduce the number of actual comparisons.
 
-    Already-dropped images never become anchors — that prevents a chain
-    of "near to last-kept" pages from cascading drops onto pages that
-    aren't actually near the kept anchor.
+    Already-dropped images never become anchors — that prevents a chain of "near
+    to last-kept" pages from cascading drops onto pages that aren't actually near
+    the kept anchor.
 
-    ``items`` may contain ``None`` (compute_dhash failure) — those
-    indices are passed through (never dropped, never used as anchor).
+    ``items`` may contain ``None`` (compute_dhash failure) — those indices are
+    passed through (never dropped, never used as anchor).
     """
     n = len(items)
     dropped: set[int] = set()
@@ -78,10 +100,6 @@ def dedup_dhash(
         a = items[i]
         if a is None:
             continue
-        # Scan forward, collecting at most ``window`` non-dropped
-        # comparison targets.  If some are dropped mid-scan (matched
-        # by this anchor), the loop continues past the original
-        # window boundary to fill the queue.
         cmp_count = 0
         j = i + 1
         while cmp_count < window and j < n:
@@ -94,54 +112,16 @@ def dedup_dhash(
                 continue
             if _hamming_hex(a, b) <= threshold:
                 dropped.add(j)
-                # j is dropped — do NOT increment cmp_count; the
-                # dropped slot is replaced by the next non-dropped
-                # item (queue fills forward).
+                # dropped slot is replaced by next non-dropped item
             else:
                 cmp_count += 1
             j += 1
     return sorted(dropped)
 
 
-# ── Invalid-page pattern matching ──────────────────────────────────────────
-#
-# Patterns are matched after _normalize_for_match strips whitespace and all
-# non-alphanumeric/non-CJK characters and lowercases ASCII.  Pick patterns
-# that are simultaneously:
-#   - Specific enough that they don't appear in real lecture material
-#     (avoid bare campus names, common headings).
-#   - Long enough (≥6 normalized chars where possible) that incidental
-#     OCR mis-recognition doesn't accidentally hit them.
-#   - Drawn from features unique to the noise screens (URLs, the long
-#     official policy titles, the EV recording pipeline references, the
-#     classroom-equipment shutdown reminder).
-INVALID_PAGE_PATTERNS: list[str] = [
-    # ── Type 1: classroom desktop wallpaper ──
-    "请不要关闭设备",
-    "避免耽误第34节上课",
-    "触控显示器无线话筒hdmi",
-    "多媒体值班室",
-    "本教室装有摄录及安全装置",
-    # ── Type 2: e-learning resource portal screen ──
-    "cfdfudaneducn",                       # the cfd.fudan.edu.cn URL
-    "icoursefudaneducn",                   # the icourse.fudan.edu.cn URL
-    "智慧教学资源平台使用规范",
-    "教育部等九部门",
-    "加快推进教育数字化",
-    "本科课程评教提醒",
-    "请于期末考试前完成评教",
-    "微信搜索并关注复旦课评",
-    "国务院关于深入实施",
-    "板书效果展示",
-    "双屏效果展示",
-    "课程录制exe",
-    "ev去噪",
-    "录制完成桌面会生成",
-    "推荐上传至elearning",
-    "ppt演示者视图会影响录屏",
-]
-
-_NORMALIZE_RE = re.compile(r"[\W_]+", re.UNICODE)
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2 — Full-page invalidation  (post-OCR)
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def _normalize_for_match(text: str) -> str:
@@ -159,139 +139,22 @@ def is_invalid_page(text: str) -> bool:
     return any(p in norm for p in INVALID_PAGE_PATTERNS)
 
 
-# ── OCR UI noise stripping ───────────────────────────────────────────────────
-# iCourse captures screenshots of the entire desktop, so every slide includes
-# the PowerPoint ribbon (tabs, buttons, status bar) plus occasionally the
-# Word/PDF window chrome when the instructor switches applications.  The OCR
-# dutifully transcribes every label, producing boilerplate that wastes LLM
-# prompt budget.
-#
-# Stopword strategy:
-#   - ONLY strip an entire line that exactly matches a known UI label
-#     (after normalisation).  Substring matching would risk removing
-#     real content — e.g. "幻灯片" is a stopword, but "幻灯片设计原则"
-#     should pass through.
-#   - Single-char stopwords are included because the PowerPoint ribbon
-#     shows standalone icon labels (e.g. "口" for the rectangle shape
-#     gallery).  They appear on 50+ pages each across courses and
-#     contribute zero semantics.  Lines that happen to be JUST "口"
-#     from a real slide are astronomically unlikely — a lecture slide
-#     that discusses the character 口 wouldn't put it on its own line
-#     in a 720p+ screenshot.
-#   - Regex patterns catch status-bar items whose numeric part varies
-#     (zoom %, word count, page N of M).
-#
-# The stopword set is derived from frequency analysis of OCR'd ppt_pages
-# rows across 7 real lectures in 5 different courses (2026-05-22 data
-# from the decrypted data-branch DB).
+def normalize_for_match(text: str) -> str:  # noqa: D401
+    """Public alias for tests / debugging."""
+    return _normalize_for_match(text)
 
-# Exact-match (case-folded, whitespace-stripped) UI labels to drop.
-# Sorted roughly by PowerPoint ribbon region for maintainability.
-PPT_UI_STOPWORDS: set[str] = {
-    # ── Ribbon tabs ──
-    "文件", "开始", "插入", "设计", "切换", "动画",
-    "幻灯片放映", "审阅", "视图", "加载项", "帮助",
-    # ── Home tab clusters ──
-    "粘贴", "剪切", "复制", "格式刷", "新建", "重置",
-    "剪贴板", "字体", "段落", "快速样式", "样式",
-    "绘图", "编辑", "排列", "形状填充", "形状轮廓",
-    "形状效果", "选择", "查找", "替换", "a替换",
-    "ac替换", "目复制", "突出显示", "擦除",
-    # ── Insert / Design / Transitions tabs ──
-    "表格", "图片", "形状", "图标", "SmartArt", "图表",
-    "文本框", "页眉和页脚", "艺术字", "公式", "符号",
-    "视频", "音频", "屏幕录制",
-    "主题", "变体", "格式", "背景格式",
-    "切换到此幻灯片",
-    # ── Animations / Slide Show tabs ──
-    "动画窗格", "添加动画", "触发",
-    "从头开始", "从当前幻灯片开始", "自定义放映",
-    "设置幻灯片放映", "隐藏幻灯片",
-    # ── Review / View tabs ──
-    "拼写和语法", "同义词库", "字数统计", "批注",
-    "显示批注", "比较", "接受", "拒绝",
-    "页面视图", "阅读视图", "大纲视图",
-    "备注", "备注页", "显示比例", "适应窗口",
-    "标尺", "网格线", "参考线",
-    "拆分", "新建窗口", "全部重排", "层叠",
-    "切换窗口", "宏",
-    # ── Status bar ──
-    "中文（中国）", "简体", "登录", "共享",
-    "备注", "批注", "幻灯片", "+创建", "十创建",
-    "告诉我您想要做什么",
-    "A朗读此页内容", "朗读此页内容",
-    # ── Drawing / Shape tools (contextual tab sub-labels) ──
-    "绘制", "编辑形状", "文本填充", "文本轮廓",
-    "文本效果", "转换为SmartArt", "选择窗格",
-    "上移一层", "下移一层",
-    # ── Single-char icon labels (appear 15-100+ pages each) ──
-    # These are icon-only PowerPoint buttons that OCR reads as a
-    # single character.  The list is restricted to characters that
-    # appeared on ≥10 distinct pages across our 7-lecture sample
-    # AND are consistent with ribbon/gallery icons.
-    "口", "品", "日", "昆", "国", "田", "单", "回",
-    "器", "三",
-    # Keyboard-shortcut hint letters (Alt-key ribbon navigation).
-    # Each appears on 8-40+ distinct pages, evenly across courses.
-    "A", "B", "C", "D", "H", "I", "K", "M", "P", "Q", "S",
-    "X", "a", "b", "k", "w", "x",
-    # ── Font/typeface labels in the ribbon ──
-    "楷体", "五号", "五号AA", "A字", "Aa",
-    # ── Common OCR garbage from UI chrome ──
-    "三菜单", "国版式", "目复制",
-    "AaBbCc", "AaBbCcDAaBbCcDAaBbCcAaBbCc",
-    "登录共享", "）简体",
-    # ── Ribbon paragraph-formatting labels ──
-    "I文字方向", "文字方向", "[对齐文本", "[]对齐文本",
-    "对齐文本", "↑←",
-    "abc替换", "c替换",
-    # ── Truncated/fused toolbar labels ──
-    "告诉我您想要做什", "形状轮廊",
-    # Fused adjacent ribbon labels (OCR treats them as one line)
-    "幻灯片节",
-    # ── Style gallery labels from the Home tab ──
-    "日期", "邮件",
-}
 
-# Regex patterns for status-bar / window-chrome text whose value varies.
-# Applied per-line; a line that matches in full is dropped.
-#
-# Note: the date pattern only fires for isolated date-like lines
-# (length 5-12 chars) so actual slide content containing dates is
-# unaffected — a slide about "2026-05-22 会议纪要" is 16 chars
-# and won't match.
-_UI_NOISE_LINE_RES: list[re.Pattern] = [
-    re.compile(r"^(?:幻灯片\s*)?第\d+[页张][,，]?\s*共\d+[页张]$"),  # page/slide N of M
-    re.compile(r"^\d{1,3}%$"),                          # zoom level
-    re.compile(r"^\d{1,6}个字$"),                       # word count
-    re.compile(r"^/\d{1,3}$"),                           # e.g. "/19"
-    re.compile(r"^\d{4}-\d{2}-\d{2}$"),                  # isolated date stamp
-    re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$"),            # timestamp HH:MM or HH:MM:SS
-    re.compile(r"^[A-Z][a-z]+\d{1,2},\s*\d{4}$"),       # e.g. "May29,2025"
-    re.compile(r"^First Pa\.\.$"),                       # truncated "First Page"
-    re.compile(r"^AbstractJAbs?tra\.+$"),                # truncated abstracts
-    re.compile(r"^AuthorJCompact$"),                     # Word metadata                      # author name in isolation
-    re.compile(r"^Uabexx²+$"),                           # formula OCR noise
-    re.compile(r"^[A-Z]\.$"),                            # single initial like "A."
-    re.compile(r"^[A-Z][a-z]+University\)?$"),           # e.g. "FudanUniversity)"
-    re.compile(r"^☆.{4,}.+$"),                           # truncated window titles
-    re.compile(r"^.*\.docx[- ].*Word$"),                 # Word window title
-    re.compile(r"^.*\.pptx[- ].*PowerPoint$"),           # PPT window title
-    re.compile(r"^单击此处添加(?:备注|标题|副标题|正文)$"),  # PPT placeholder text
-]
-
-_NORMALIZE_UI_RE = re.compile(r"[\s　]+")
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 3 — Per-line UI chrome stripping  (post-invalidation)
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def clean_ppt_text(text: str) -> str:
-    """Remove PowerPoint window-chrome noise from OCR'd slide text.
+    """Remove window-chrome noise from OCR'd slide text.
 
-    Operates per-line so a slide mixing real content and UI labels
-    keeps the former while stripping the latter.  Returns the
-    cleaned text (may be empty for a fully-noise slide).
-
-    This is a *generic* filter — it does NOT use any course-specific
-    vocabulary or subject-matter hotwords.
+    Operates per-line so a slide mixing real content and UI labels keeps the
+    former while stripping the latter.  Returns the cleaned text (may be empty
+    for a fully-noise page).
     """
     if not text:
         return ""
@@ -300,8 +163,12 @@ def clean_ppt_text(text: str) -> str:
         s = line.strip()
         if not s:
             continue
+        # ≤2 char lines are virtually always UI chrome (ribbon icons, IME
+        # indicators, single letters from Alt-key shortcuts, etc.).
+        if len(s) <= 2:
+            continue
         # Normalise away the full-width ideographic space (U+3000) that
-        # PowerPoint uses in its ribbon layout, and any repeated spaces.
+        # PowerPoint uses in its ribbon layout, and repeated spaces.
         norm = _NORMALIZE_UI_RE.sub("", s).strip()
         if not norm:
             continue
@@ -317,19 +184,9 @@ def clean_ppt_text(text: str) -> str:
     return "\n".join(kept)
 
 
-# ── Text subset dedup (post-OCR, pre-prompt) ──────────────────────────────────
-# Removes pages whose text is a near-subset of a nearby page — these are
-# typically intermediate frames from PPT animation reveal (one bullet at a
-# time, progressive formula disclosure, etc.).  Operates on a sliding window
-# of recently-seen pages with directional containment (not symmetric Jaccard).
-
-_SUBSET_CONFIG = {
-    "window": 8,
-    "ngram_n": 3,
-    "containment_threshold": 0.85,
-    "min_length_ratio": 1.10,
-    "protect_min_chars": 30,
-}
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 4 — Text subset dedup  (post-cleaning, pre-prompt)
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 def _normalize_subset(s: str) -> str:
@@ -346,16 +203,15 @@ def _ngrams(t: str, n: int = 3) -> set[str]:
 def dedup_text_subset(pages: list[dict]) -> list[dict]:
     """Sliding-window text subset dedup for PPT OCR pages.
 
-    Uses directional 3-gram containment to detect pages whose text is
-    a near-subset of a nearby page (common with PPT animation reveals).
+    Uses directional 3-gram containment to detect pages whose text is a
+    near-subset of a nearby page (common with PPT animation reveals).
     No line-level heuristics — OCR line breaks are unreliable.
 
     ``pages``: list of dicts, each with at least a ``text`` key.
     Returns filtered list with near-subset pages removed.
     """
-    cfg = _SUBSET_CONFIG
+    cfg = SUBSET_CONFIG
 
-    # Pre-normalize + compute 3-gram sets
     texts = [_normalize_subset(p.get("text") or "") for p in pages]
     ng_sets = [_ngrams(t, cfg["ngram_n"]) for t in texts]
     lengths = [len(t) for t in texts]
@@ -363,25 +219,21 @@ def dedup_text_subset(pages: list[dict]) -> list[dict]:
     keep = [True] * len(pages)
 
     for idx in range(1, len(pages)):
-        # Sliding window: only consider last ``window`` *kept* pages
         window_start = max(0, idx - cfg["window"])
 
         for old_idx in range(window_start, idx):
             if not keep[old_idx]:
                 continue
 
-            # Determine shorter vs longer
             if lengths[idx] < lengths[old_idx]:
                 short, long = idx, old_idx
             else:
                 short, long = old_idx, idx
 
-            # Protection: very short pages
             effective_threshold = cfg["containment_threshold"]
             if lengths[short] < cfg["protect_min_chars"]:
                 effective_threshold = 0.95
 
-            # Directional containment
             if not ng_sets[short]:
                 continue
             containment = len(ng_sets[short] & ng_sets[long]) / len(ng_sets[short])
@@ -390,16 +242,10 @@ def dedup_text_subset(pages: list[dict]) -> list[dict]:
             if containment < effective_threshold or length_ratio < cfg["min_length_ratio"]:
                 continue
 
-            # Confirmed: short is a subset of long
             if short == idx:
-                keep[idx] = False      # new page is subset → discard new
+                keep[idx] = False
             else:
-                keep[old_idx] = False  # old page is subset → delete old
-            break  # one decision per new page
+                keep[old_idx] = False
+            break
 
     return [p for p, k in zip(pages, keep) if k]
-
-
-def normalize_for_match(text: str) -> str:  # noqa: D401  exported wrapper
-    """Public alias for tests / debugging."""
-    return _normalize_for_match(text)

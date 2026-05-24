@@ -51,3 +51,5 @@ db-viewer/
 
 .claude/
 # .github/
+# Shard inspection temp files
+_shard_inspect/
