@@ -200,34 +200,39 @@ class WebVPNSession:
 
         # Follow redirect chain to reach IDP login page and extract lck.
         # The CAS gateway occasionally returns 200 + an HTML interstitial
-        # instead of a 302 chain — a short sleep gives it time to settle.
+        # instead of a 302 chain — retry a few times before giving up so
+        # we don't force a full WebVPN re-login for a transient hiccup.
         import time as _time
-        _time.sleep(1)
-
-        resp = self.session.get(vpn_url, allow_redirects=False, timeout=60)
         lck = None
-        for _ in range(15):
-            location = resp.headers.get("Location", "")
-            if resp.status_code not in (301, 302, 303, 307) or not location:
+        for cas_attempt in range(3):
+            if cas_attempt > 0:
+                _time.sleep(2)
+                print(f"    CAS lck extract retry {cas_attempt}/2...")
+            resp = self.session.get(vpn_url, allow_redirects=False, timeout=60)
+            for _ in range(15):
+                location = resp.headers.get("Location", "")
+                if resp.status_code not in (301, 302, 303, 307) or not location:
+                    break
+                lck_match = re.search(r'lck=([^&#"]+)', location)
+                if lck_match:
+                    lck = lck_match.group(1)
+                    break
+                if not location.startswith("http"):
+                    location = urljoin(resp.url, location)
+                resp = self.session.get(
+                    location, allow_redirects=False, timeout=60
+                )
+            if lck:
                 break
-            lck_match = re.search(r'lck=([^&#"]+)', location)
-            if lck_match:
-                lck = lck_match.group(1)
-                break
-            if not location.startswith("http"):
-                location = urljoin(resp.url, location)
-            resp = self.session.get(
-                location, allow_redirects=False, timeout=60
-            )
-
-        if not lck:
-            # Check final response URL, body, AND any redirect history
+            # Check final response for lck embedded in HTML
             for source in [resp.url, resp.text[:5000],
                            str(getattr(resp, 'history', []))]:
                 m = re.search(r'lck=([^&#"]+)', source)
                 if m:
                     lck = m.group(1)
                     break
+            if lck:
+                break
         if not lck:
             raise RuntimeError(
                 f"Failed to extract lck from CAS redirect chain (status={resp.status_code})"
