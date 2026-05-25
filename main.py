@@ -282,12 +282,14 @@ def run():
     client = ICourseClient(vpn)
     email_items: list = []
 
-    # Refresh the semester catalog on a schedule (~2× per month) so the
-    # frontend subscription editor stays current without hammering the API.
-    if datetime.now().day % 14 == 0:
+    # Refresh the semester catalog: run on the 5th and 25th of each month,
+    # or immediately if the database has no catalog data yet.
+    has_catalog = bool(db.list_all_courses())
+    today = datetime.now().day
+    if not has_catalog or today in (5, 25):
         _crawl_semester_catalog(client, db, reporter)
     else:
-        reporter.info("Skipping catalog crawl (day % 14 != 0).")
+        reporter.info("Skipping catalog crawl (has data, not the 5th or 25th).")
 
     if not config.COURSE_IDS:
         # Crawl-only mode: nothing to process, just persist + exit.
