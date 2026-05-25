@@ -14,7 +14,7 @@
   <!-- Custom CSS -->
   <link rel="stylesheet" href="css/app.css">
 </head>
-<body class="bg-gray-50 h-[100dvh] flex flex-col" x-data="app()" x-cloak>
+<body class="bg-gray-50 min-h-[100dvh]" x-data="app()" x-cloak>
 
 <!-- ╔══════════════════════════════════════════════════════╗
      ║  UNIFIED BAR                                         ║
@@ -155,7 +155,7 @@
 <!-- ╔══════════════════════════════════════╗
      ║  MAIN CONTENT AREA                   ║
      ╚══════════════════════════════════════╝ -->
-<main class="flex-1 overflow-y-auto pb-20 md:pb-6">
+<main class="pb-20 md:pb-6">
 
   <!-- ─── LOADING ─── -->
   <div x-show="view === 'loading'" class="flex flex-col items-center justify-center h-[60vh] gap-4">
