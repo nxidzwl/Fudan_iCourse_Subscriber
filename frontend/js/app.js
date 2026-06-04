@@ -254,6 +254,8 @@ document.addEventListener("alpine:init", () => {
     searchQuery: "", searchResults: [],
     searchCourseFilterQuery: "", searchSelectedCourseIds: [],
     searchCourseOpen: false,
+    searchPage: 1, searchHasMore: false,
+    searchDomains: { summary: true, sub_title: true, transcript: true, ocr: true },
     commitSha: null,
     setup: { token: "", stuid: "", uispsw: "" },
     setupError: "", setupTesting: false,
@@ -582,10 +584,35 @@ document.addEventListener("alpine:init", () => {
     doSearch() {
       clearTimeout(this._searchTimeout);
       this._searchTimeout = setTimeout(() => {
-        this.searchResults = this.searchQuery.trim()
-          ? ICS.db.searchSummaries(this.searchQuery, this.searchSelectedCourseIds)
-          : [];
+        this._loadSearchResults(1);
       }, 300);
+    },
+    _loadSearchResults(page) {
+      if (!this.searchQuery.trim()) {
+        this.searchResults = [];
+        this.searchHasMore = false;
+        this.searchPage = 1;
+        return;
+      }
+      var result = ICS.db.searchSummaries(
+        this.searchQuery, this.searchSelectedCourseIds,
+        page, 50, this.searchDomains,
+      );
+      if (page <= 1) {
+        this.searchResults = result.results;
+      } else {
+        [].push.apply(this.searchResults, result.results);
+      }
+      this.searchPage = result.page;
+      this.searchHasMore = result.hasMore;
+    },
+    loadMore() {
+      this._loadSearchResults(this.searchPage + 1);
+    },
+    toggleSearchDomain(domain) {
+      this.searchDomains = Object.assign({}, this.searchDomains);
+      this.searchDomains[domain] = !this.searchDomains[domain];
+      this.doSearch();
     },
 
     async refresh() {

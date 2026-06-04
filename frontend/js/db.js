@@ -164,43 +164,75 @@ function _getPptPages(subId) {
   `, [subId]);
 }
 
-function _searchSummaries(query, courseIds) {
-  if (!query?.trim()) return [];
-  // Match against summary, transcript, and sub_title.  Transcript is the
-  // most useful for "I remember the teacher said X" lookups; summary
-  // covers "I read it in the notes"; sub_title covers session names.
-  // We mark which field hit so the UI can show the right snippet.
+function _searchSummaries(query, courseIds, page, pageSize, domains) {
+  if (!query?.trim()) return { results: [], page: 1, hasMore: false };
+  page = page || 1;
+  pageSize = pageSize || 50;
+  const offset = (page - 1) * pageSize;
   const q = query;
-  var textMatchClause = `
-    l.summary    LIKE '%' || ? || '%'
-       OR l.sub_title  LIKE '%' || ? || '%'
-       OR l.transcript LIKE '%' || ? || '%'
-       OR EXISTS(SELECT 1 FROM ppt_pages pp3 WHERE pp3.sub_id = l.sub_id AND pp3.text LIKE '%' || ? || '%')
-  `;
-  var whereClauses = ["(" + textMatchClause + ")"];
-  // Params order matches the SQL placeholder order:
-  // 1 (ppt_text) + 4 (CASE hit_field) + 4 (WHERE text match)
-  var params = [q, q, q, q, q, q, q, q, q];
+
+  // Domain flags — default all enabled
+  const d = domains || {};
+  const matchSummary = d.summary !== false;
+  const matchSubtitle = d.sub_title !== false;
+  const matchTranscript = d.transcript !== false;
+  const matchOcr = d.ocr !== false;
+
+  // Build WHERE parts per active domain
+  var textParts = [];
+  var textParams = [];
+  function addText(cond) { textParts.push(cond); textParams.push(q); }
+  if (matchSummary)    addText("l.summary    LIKE '%' || ? || '%'");
+  if (matchSubtitle)   addText("l.sub_title  LIKE '%' || ? || '%'");
+  if (matchTranscript) addText("l.transcript LIKE '%' || ? || '%'");
+  if (matchOcr)        addText("EXISTS(SELECT 1 FROM ppt_pages pp3 WHERE pp3.sub_id = l.sub_id AND pp3.ocr_status = 'done' AND pp3.text LIKE '%' || ? || '%')");
+
+  if (!textParts.length) return { results: [], page: 1, hasMore: false };
+
+  // Build hit_field CASE for active domains
+  var caseParts = [];
+  var caseParams = [];
+  function addCase(when, then) { caseParts.push("WHEN " + when + " THEN '" + then + "'"); caseParams.push(q); }
+  if (matchSummary)    addCase("l.summary    LIKE '%' || ? || '%'", "summary");
+  if (matchSubtitle)   addCase("l.sub_title  LIKE '%' || ? || '%'", "sub_title");
+  if (matchTranscript) addCase("l.transcript LIKE '%' || ? || '%'", "transcript");
+  if (matchOcr)        addCase("EXISTS(SELECT 1 FROM ppt_pages pp2 WHERE pp2.sub_id = l.sub_id AND pp2.ocr_status = 'done' AND pp2.text LIKE '%' || ? || '%')", "ocr");
+
+  // ppt_text subquery (for OCR snippet, only when OCR domain active)
+  var pptSql = matchOcr
+    ? "(SELECT pp.text FROM ppt_pages pp WHERE pp.sub_id = l.sub_id AND pp.ocr_status = 'done' AND pp.text LIKE '%' || ? || '%' LIMIT 1)"
+    : "NULL";
+  var pptParams = matchOcr ? [q] : [];
+
+  // Full params: ppt_text + CASE + WHERE
+  var params = pptParams.concat(caseParams, textParams);
+
+  // WHERE clause with optional course filter
+  var whereClauses = ["(" + textParts.join("\n           OR ") + ")"];
   if (courseIds && courseIds.length) {
     var placeholders = courseIds.map(function () { return "?"; }).join(",");
     whereClauses.push("l.course_id IN (" + placeholders + ")");
     courseIds.forEach(function (id) { params.push(String(id)); });
   }
-  return _queryAll(`
+
+  var caseSql = caseParts.length
+    ? "CASE\n             " + caseParts.join("\n             ") + "\n             ELSE 'other'\n           END"
+    : "'other'";
+
+  // Fetch pageSize+1 rows to detect whether a next page exists
+  var rows = _queryAll(`
     SELECT l.sub_id, l.sub_title, l.summary, l.transcript,
-           (SELECT pp.text FROM ppt_pages pp WHERE pp.sub_id = l.sub_id AND pp.text LIKE '%' || ? || '%' LIMIT 1) AS ppt_text,
+           ${pptSql} AS ppt_text,
            l.course_id, c.title AS course_title,
-           CASE
-             WHEN l.summary    LIKE '%' || ? || '%' THEN 'summary'
-             WHEN l.sub_title  LIKE '%' || ? || '%' THEN 'sub_title'
-             WHEN l.transcript LIKE '%' || ? || '%' THEN 'transcript'
-             WHEN EXISTS(SELECT 1 FROM ppt_pages pp2 WHERE pp2.sub_id = l.sub_id AND pp2.text LIKE '%' || ? || '%') THEN 'ocr'
-             ELSE 'other'
-           END AS hit_field
+           ${caseSql} AS hit_field
     FROM lectures l JOIN courses c ON l.course_id = c.course_id
     WHERE ` + whereClauses.join(" AND ") + `
-    ORDER BY l.processed_at DESC LIMIT 50
-  `, params);
+    ORDER BY l.processed_at DESC LIMIT ? OFFSET ?
+  `, params.concat([pageSize + 1, offset]));
+
+  var hasMore = rows.length > pageSize;
+  if (hasMore) rows.pop();
+  return { results: rows, page: page, hasMore: hasMore };
 }
 
 function _getAllCourses(term) {

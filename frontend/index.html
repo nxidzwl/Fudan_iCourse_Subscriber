@@ -430,6 +430,33 @@
           <input x-model="searchCourseFilterQuery" type="text"
                  placeholder="搜索课程名…"
                  class="w-full border-b px-3 py-2 text-sm sticky top-0 bg-white focus:outline-none">
+          <div class="border-b px-3 py-2 space-y-1">
+            <p class="text-xs text-gray-400 mb-1">搜索范围</p>
+            <label class="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" :checked="searchDomains.summary"
+                     @change="toggleSearchDomain('summary')"
+                     class="rounded border-gray-300 text-blue-600">
+              <span>摘要</span>
+            </label>
+            <label class="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" :checked="searchDomains.sub_title"
+                     @change="toggleSearchDomain('sub_title')"
+                     class="rounded border-gray-300 text-blue-600">
+              <span>标题</span>
+            </label>
+            <label class="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" :checked="searchDomains.transcript"
+                     @change="toggleSearchDomain('transcript')"
+                     class="rounded border-gray-300 text-blue-600">
+              <span>转录</span>
+            </label>
+            <label class="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" :checked="searchDomains.ocr"
+                     @change="toggleSearchDomain('ocr')"
+                     class="rounded border-gray-300 text-blue-600">
+              <span>OCR</span>
+            </label>
+          </div>
           <template x-for="c in searchCourseOptionsFiltered" :key="c.course_id">
             <label class="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-50 text-sm cursor-pointer">
               <input type="checkbox" :checked="searchSelectedCourseIds.includes(String(c.course_id))"
@@ -466,6 +493,12 @@
                     : r.summary, searchQuery)"></p>
         </button>
       </template>
+    </div>
+    <div x-show="searchHasMore" class="text-center mt-2">
+      <button @click="loadMore()"
+              class="px-4 py-2 text-sm text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-50">
+        加载更多
+      </button>
     </div>
   </div>
 
