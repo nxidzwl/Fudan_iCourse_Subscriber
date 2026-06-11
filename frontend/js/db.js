@@ -284,7 +284,10 @@ function _getAllCourses(term) {
 function _getAllCoursesTerms() {
   return _queryAll(
     "SELECT DISTINCT term FROM all_courses ORDER BY term DESC"
-  ).map((r) => r.term);
+  ).map((r) => r.term).filter(function (t) {
+    // Exclude legacy semesters that predate the recording system.
+    return t.indexOf("_19_") === -1 && t !== "25";
+  });
 }
 
 function _buildCatalogWhere(filters) {
