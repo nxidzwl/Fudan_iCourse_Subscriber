@@ -303,6 +303,7 @@ function _buildCatalogWhere(filters) {
   // Shared WHERE/params builder for paged search + count + dept distinct.
   // Filters: { terms: string[], depts: string[], title: string, teacher: string }
   var clauses = [];
+  var params = [];
   for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
     clauses.push("term NOT GLOB ?");
     params.push(_INVALID_TERMS_GLOB[gi]);
