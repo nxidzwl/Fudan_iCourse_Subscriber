@@ -11,6 +11,10 @@
 
 window.ICS = window.ICS || {};
 
+// Semester terms that predate the recording system — never shown anywhere.
+const _INVALID_TERMS_GLOB = ["*_19_*"];
+const _INVALID_TERMS_EXACT = ["25"];
+
 const _SQL_CDN = "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.12.0";
 let _db = null;
 let _SQL = null;
@@ -285,16 +289,28 @@ function _getAllCoursesTerms() {
   return _queryAll(
     "SELECT DISTINCT term FROM all_courses ORDER BY term DESC"
   ).map((r) => r.term).filter(function (t) {
-    // Exclude legacy semesters that predate the recording system.
-    return t.indexOf("_19_") === -1 && t !== "25";
+    for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
+      if (t.indexOf(_INVALID_TERMS_GLOB[gi].replace(/\*/g, "")) !== -1) return false;
+    }
+    for (var ei = 0; ei < _INVALID_TERMS_EXACT.length; ei++) {
+      if (t === _INVALID_TERMS_EXACT[ei]) return false;
+    }
+    return true;
   });
 }
 
 function _buildCatalogWhere(filters) {
   // Shared WHERE/params builder for paged search + count + dept distinct.
   // Filters: { terms: string[], depts: string[], title: string, teacher: string }
-  var clauses = ["term NOT GLOB '*_19_*'", "term != '25'"];
-  var params = [];
+  var clauses = [];
+  for (var gi = 0; gi < _INVALID_TERMS_GLOB.length; gi++) {
+    clauses.push("term NOT GLOB ?");
+    params.push(_INVALID_TERMS_GLOB[gi]);
+  }
+  for (var ei = 0; ei < _INVALID_TERMS_EXACT.length; ei++) {
+    clauses.push("term != ?");
+    params.push(_INVALID_TERMS_EXACT[ei]);
+  }
   if (filters.terms && filters.terms.length) {
     clauses.push("term IN (" + filters.terms.map(function () { return "?"; }).join(",") + ")");
     for (var i = 0; i < filters.terms.length; i++) params.push(filters.terms[i]);
