@@ -397,14 +397,6 @@ class Database:
                 (summary, model, sub_id),
             )
 
-    def reset_emailed(self, sub_id: str):
-        """Clear emailed_at so a re-summarized lecture re-sends on next run."""
-        with self._lock, self.conn:
-            self.conn.execute(
-                "UPDATE lectures SET emailed_at = NULL WHERE sub_id = ?",
-                (sub_id,),
-            )
-
     def get_lecture(self, sub_id: str) -> dict | None:
         """Get a single lecture row by sub_id."""
         with self._lock:

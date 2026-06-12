@@ -258,11 +258,6 @@ class PPTPipeline:
                     f"{type(e).__name__}: {e}"
                 )
 
-    def run_blocking(self, client: "ICourseClient", course_id: str,
-                     sub_id: str) -> PPTStats:
-        """submit() then drain(); convenient for callers with no parallel work."""
-        return self.submit(client, course_id, sub_id).drain()
-
     # ── Shared stages 1-3 ───────────────────────────────────────────────
 
     def _join_prefetch(self, sub_id: str) -> None:

@@ -7,9 +7,8 @@ AudioDownloader.  This file does only orchestration:
   1. Build all components.
   2. Login + enumerate.
   3. Drive LectureRunner across the queued lectures.
-  4. Resummarize old (pre-v2) lectures.
-  5. Email + bookkeeping.
-  6. Shutdown.
+  4. Email + bookkeeping.
+  5. Shutdown.
 
 Anything more interesting belongs in one of ``src/*`` modules.
 """

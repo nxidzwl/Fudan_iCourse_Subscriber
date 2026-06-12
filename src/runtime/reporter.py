@@ -233,8 +233,7 @@ class Reporter:
         """Call once per finished OCR page.  Emits every N pages and at end.
 
         Cheap and lock-free for the not-tracked case so OCR workers that
-        run from contexts without a registered start (e.g. resummarize
-        path that doesn't pre-count) don't pay any cost.
+        run from contexts without a registered start don't pay any cost.
 
         Like ``image_progress_tick``, the psutil snapshot and ``print``
         run outside the lock so the hot path serialises only on a tiny
@@ -293,7 +292,7 @@ class Reporter:
             print(f"    [Prefetch] audio for {sub_id} failed: "
                   f"{type(exc).__name__}: {exc}", flush=True)
 
-    # ── Email / resummarize / generic ────────────────────────────────────
+    # ── Email / generic ──────────────────────────────────────────────────
 
     def email_summary(self, n: int):
         with self._lock:
@@ -308,16 +307,6 @@ class Reporter:
     def email_recovered_unsent(self, n: int):
         with self._lock:
             print(f"[Email] Including {n} previously unsent lecture(s).",
-                  flush=True)
-
-    def resummarize_header(self, n: int):
-        with self._lock:
-            print(f"\n[Resummarize] {n} lecture(s) eligible for v2 upgrade.",
-                  flush=True)
-
-    def resummarize_one(self, course_title: str, sub_title: str):
-        with self._lock:
-            print(f"  -- Resummarize: [{course_title}] {sub_title}",
                   flush=True)
 
     def info(self, msg: str):
