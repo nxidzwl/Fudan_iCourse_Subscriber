@@ -118,6 +118,10 @@ _CJK_TEXT_RE = re.compile(
     r"[\u3400-\u9fff\uf900-\ufaff，。、；：！？、\sA-Za-z0-9%％°℃/·.\-_]*"
     r"\s*[）)】\]]?"
 )
+_CASES_RE = re.compile(
+    r"^(?P<prefix>[\s\S]*?)\\begin\{cases\}"
+    r"(?P<body>[\s\S]+?)\\end\{cases\}(?P<suffix>[\s\S]*)$"
+)
 
 
 def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
@@ -224,6 +228,104 @@ def _latex_text_html(text: str, is_block: bool) -> str:
     return f'<span style="{style}">{escape(text)}</span>'
 
 
+def _latex_parts_urls(parts: list[tuple[str, str]], is_block: bool) -> list[str]:
+    return [_latex_url(value, is_block) for kind, value in parts if kind == "math"]
+
+
+def _latex_parts_html(parts: list[tuple[str, str]], is_block: bool,
+                      cid_images: dict | None, embed_images: bool) -> str:
+    rendered_parts = []
+    for kind, value in parts:
+        if kind == "text":
+            rendered_parts.append(_latex_text_html(value, is_block))
+        else:
+            url = _latex_url(value, is_block)
+            rendered_parts.append(
+                _latex_image_html(url, value, is_block, cid_images, embed_images)
+            )
+    return "".join(rendered_parts)
+
+
+def _split_cases_rows(body: str) -> list[str]:
+    return [row.strip() for row in re.split(r"\\\\(?:\s*\[[^\]]*\])?", body) if row.strip()]
+
+
+def _cases_image_urls(latex_content: str) -> list[str]:
+    match = _CASES_RE.match(latex_content.strip())
+    if not match:
+        return _latex_parts_urls(_split_latex_cjk(latex_content), True)
+
+    urls = []
+    prefix = match.group("prefix").strip()
+    suffix = match.group("suffix").strip()
+    if prefix:
+        urls.append(_latex_url(prefix, False))
+    for row in _split_cases_rows(match.group("body")):
+        expr, _, condition = row.partition("&")
+        expr = expr.rstrip(",;，； ").strip()
+        condition = condition.strip(",;，； ")
+        if expr:
+            urls.append(_latex_url(expr, False))
+        if condition:
+            urls.extend(_latex_parts_urls(_split_latex_cjk(condition), False))
+    if suffix:
+        urls.append(_latex_url(suffix, False))
+    return urls
+
+
+def _cases_html(latex_content: str, cid_images: dict | None,
+                embed_images: bool) -> str:
+    match = _CASES_RE.match(latex_content.strip())
+    if not match:
+        return _latex_parts_html(
+            _split_latex_cjk(latex_content), True, cid_images, embed_images
+        )
+
+    prefix = match.group("prefix").strip()
+    suffix = match.group("suffix").strip()
+    rows = []
+    for row in _split_cases_rows(match.group("body")):
+        expr, _, condition = row.partition("&")
+        expr = expr.rstrip(",;，； ").strip()
+        condition = condition.strip(",;，； ")
+        expr_html = (
+            _latex_image_html(
+                _latex_url(expr, False), expr, False, cid_images, embed_images
+            )
+            if expr else ""
+        )
+        condition_html = (
+            _latex_parts_html(
+                _split_latex_cjk(condition), False, cid_images, embed_images
+            )
+            if condition else ""
+        )
+        rows.append(
+            "<tr>"
+            f'<td style="padding:2px 8px;text-align:left;border:none;background:transparent;">{expr_html}</td>'
+            f'<td style="padding:2px 0;text-align:left;border:none;background:transparent;">{condition_html}</td>'
+            "</tr>"
+        )
+
+    prefix_html = (
+        _latex_image_html(_latex_url(prefix, False), prefix, False,
+                          cid_images, embed_images)
+        if prefix else ""
+    )
+    suffix_html = (
+        _latex_image_html(_latex_url(suffix, False), suffix, False,
+                          cid_images, embed_images)
+        if suffix else ""
+    )
+    table_html = (
+        '<table style="display:inline-table;vertical-align:middle;border-collapse:collapse;'
+        'width:auto;margin:0;border-left:2px solid #1a1a1a;">'
+        + "".join(rows)
+        + "</table>"
+    )
+    return prefix_html + table_html + suffix_html
+
+
 def _md_to_html(md_text: str, cid_images: dict | None = None,
                 embed_images: bool = False) -> str:
     """Convert Markdown to styled HTML, rendering LaTeX math as images.
@@ -289,41 +391,36 @@ def _md_to_html(md_text: str, cid_images: dict | None = None,
     # Build URL list and pre-fetch all LaTeX images concurrently.
     # CJK text is split out and rendered as normal HTML text because the
     # remote LaTeX image service does not reliably support Chinese glyphs.
-    latex_info: dict[str, tuple[list[tuple[str, str]], bool]] = {}
+    latex_info: dict[str, tuple[str, object, bool]] = {}
     image_urls: list[str] = []
     for key, original in latex_map.items():
         is_block = original.startswith("$$")
         latex_content = original[2:-2] if is_block else original[1:-1]
-        parts = _split_latex_cjk(latex_content)
-        latex_info[key] = (parts, is_block)
-        image_urls.extend(
-            _latex_url(value, is_block)
-            for kind, value in parts
-            if kind == "math"
-        )
+        if _CJK_RE.search(latex_content) and _CASES_RE.match(latex_content.strip()):
+            latex_info[key] = ("cases", latex_content, is_block)
+            image_urls.extend(_cases_image_urls(latex_content))
+        else:
+            parts = _split_latex_cjk(latex_content)
+            latex_info[key] = ("parts", parts, is_block)
+            image_urls.extend(_latex_parts_urls(parts, is_block))
 
     _prefetch_latex_images(image_urls)
 
-    for key, (parts, is_block) in latex_info.items():
-        rendered_parts = []
-        for kind, value in parts:
-            if kind == "text":
-                rendered_parts.append(_latex_text_html(value, is_block))
-            else:
-                url = _latex_url(value, is_block)
-                rendered_parts.append(
-                    _latex_image_html(
-                        url, value, is_block, cid_images, embed_images
-                    )
-                )
+    for key, (kind, payload, is_block) in latex_info.items():
+        if kind == "cases":
+            rendered = _cases_html(str(payload), cid_images, embed_images)
+        else:
+            rendered = _latex_parts_html(
+                payload, is_block, cid_images, embed_images
+            )
 
         if is_block:
             img_tag = (
                 f'<div style="text-align:center;margin:16px 0">'
-                f'{"".join(rendered_parts)}</div>'
+                f'{rendered}</div>'
             )
         else:
-            img_tag = "".join(rendered_parts)
+            img_tag = rendered
 
         html = html.replace(key, img_tag)
 
