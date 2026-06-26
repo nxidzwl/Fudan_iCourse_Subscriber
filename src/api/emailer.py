@@ -111,6 +111,13 @@ li { margin-bottom: 4px; }
 _MIN_INLINE_HEIGHT = 13  # minimum logical height for inline formulas (px)
 
 _IMAGE_CACHE: dict[str, tuple] = {}
+_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_CJK_TEXT_RE = re.compile(
+    r"\\(?:text|mbox|mathrm|operatorname)\{([^{}]*[\u3400-\u9fff\uf900-\ufaff][^{}]*)\}"
+    r"|[（(【\[]?\s*[\u3400-\u9fff\uf900-\ufaff]"
+    r"[\u3400-\u9fff\uf900-\ufaff，。、；：！？、\sA-Za-z0-9%％°℃/·.\-_]*"
+    r"\s*[）)】\]]?"
+)
 
 
 def _fetch_latex_image(url: str, dpi: int = 300) -> tuple:
@@ -152,6 +159,69 @@ def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
         futures = {pool.submit(_fetch_latex_image, u, dpi): u for u in uncached}
         for future in as_completed(futures):
             future.result()  # trigger any exception logging inside _fetch_latex_image
+
+
+def _split_latex_cjk(latex_content: str) -> list[tuple[str, str]]:
+    """Split CJK text out of LaTeX content so CodeCogs need not render it."""
+    if not _CJK_RE.search(latex_content):
+        return [("math", latex_content)]
+
+    parts: list[tuple[str, str]] = []
+    pos = 0
+    for match in _CJK_TEXT_RE.finditer(latex_content):
+        if match.start() > pos:
+            math_part = latex_content[pos:match.start()]
+            if math_part.strip():
+                parts.append(("math", math_part))
+        text_part = match.group(1) if match.group(1) is not None else match.group(0)
+        if text_part.strip():
+            parts.append(("text", text_part.strip()))
+        pos = match.end()
+
+    if pos < len(latex_content):
+        math_part = latex_content[pos:]
+        if math_part.strip():
+            parts.append(("math", math_part))
+    return parts or [("text", latex_content)]
+
+
+def _latex_url(latex_content: str, is_block: bool) -> str:
+    prefix = r"\dpi{300}\bg{white}" if is_block else r"\dpi{300}\bg{white}\inline"
+    return f"https://latex.codecogs.com/png.latex?{prefix}%20{quote(latex_content)}"
+
+
+def _latex_image_html(url: str, latex_content: str, is_block: bool,
+                      cid_images: dict | None, embed_images: bool) -> str:
+    w, h, img_data = _fetch_latex_image(url)
+
+    if not (w and h):
+        return f'<code>{escape(latex_content)}</code>'
+
+    if not is_block and h < _MIN_INLINE_HEIGHT:
+        scale = _MIN_INLINE_HEIGHT / h
+        w = max(1, int(w * scale))
+        h = _MIN_INLINE_HEIGHT
+
+    src = _resolve_src(url, img_data, cid_images, embed_images)
+    if is_block:
+        style = (
+            f"width:{w}px;height:{h}px;max-width:none;"
+            "vertical-align:middle;border:none;display:inline-block;"
+        )
+    else:
+        style = (
+            f"width:{w}px;height:{h}px;max-width:none;"
+            "vertical-align:-3px;border:none;margin:0 2px;"
+        )
+    return (
+        f'<img src="{src}" alt="{escape(latex_content)}" '
+        f'width="{w}" height="{h}" style="{style}">'
+    )
+
+
+def _latex_text_html(text: str, is_block: bool) -> str:
+    style = "vertical-align:middle;margin:0 2px;" if is_block else ""
+    return f'<span style="{style}">{escape(text)}</span>'
 
 
 def _md_to_html(md_text: str, cid_images: dict | None = None,
@@ -216,54 +286,44 @@ def _md_to_html(md_text: str, cid_images: dict | None = None,
         extension_configs=_MD_EXTENSION_CONFIGS,
     )
 
-    # Build URL list and pre-fetch all LaTeX images concurrently
-    # Each entry: (url, latex_content, is_block)
-    latex_info: dict[str, tuple[str, str, bool]] = {}
+    # Build URL list and pre-fetch all LaTeX images concurrently.
+    # CJK text is split out and rendered as normal HTML text because the
+    # remote LaTeX image service does not reliably support Chinese glyphs.
+    latex_info: dict[str, tuple[list[tuple[str, str]], bool]] = {}
+    image_urls: list[str] = []
     for key, original in latex_map.items():
         is_block = original.startswith("$$")
         latex_content = original[2:-2] if is_block else original[1:-1]
-        prefix = r"\dpi{300}\bg{white}" if is_block else r"\dpi{300}\bg{white}\inline"
-        url = f"https://latex.codecogs.com/png.latex?{prefix}%20{quote(latex_content)}"
-        latex_info[key] = (url, latex_content, is_block)
+        parts = _split_latex_cjk(latex_content)
+        latex_info[key] = (parts, is_block)
+        image_urls.extend(
+            _latex_url(value, is_block)
+            for kind, value in parts
+            if kind == "math"
+        )
 
-    _prefetch_latex_images([info[0] for info in latex_info.values()])
+    _prefetch_latex_images(image_urls)
 
-    for key, (url, latex_content, is_block) in latex_info.items():
-        w, h, img_data = _fetch_latex_image(url)
+    for key, (parts, is_block) in latex_info.items():
+        rendered_parts = []
+        for kind, value in parts:
+            if kind == "text":
+                rendered_parts.append(_latex_text_html(value, is_block))
+            else:
+                url = _latex_url(value, is_block)
+                rendered_parts.append(
+                    _latex_image_html(
+                        url, value, is_block, cid_images, embed_images
+                    )
+                )
 
         if is_block:
-            if w and h:
-                src = _resolve_src(url, img_data, cid_images, embed_images)
-                img_tag = (
-                    f'<div style="text-align:center;margin:16px 0">'
-                    f'<img src="{src}" alt="{escape(latex_content)}" '
-                    f'width="{w}" height="{h}" '
-                    f'style="width:{w}px;height:{h}px;max-width:none;'
-                    f'vertical-align:middle;border:none;display:inline-block;">'
-                    f'</div>'
-                )
-            else:
-                img_tag = (
-                    f'<div style="text-align:center;margin:16px 0">'
-                    f'<code>{escape(latex_content)}</code></div>'
-                )
+            img_tag = (
+                f'<div style="text-align:center;margin:16px 0">'
+                f'{"".join(rendered_parts)}</div>'
+            )
         else:
-            if w and h:
-                # Enforce minimum height so formulas aren't smaller than text
-                if h < _MIN_INLINE_HEIGHT:
-                    scale = _MIN_INLINE_HEIGHT / h
-                    w = max(1, int(w * scale))
-                    h = _MIN_INLINE_HEIGHT
-
-                src = _resolve_src(url, img_data, cid_images, embed_images)
-                img_tag = (
-                    f'<img src="{src}" alt="{escape(latex_content)}" '
-                    f'width="{w}" height="{h}" '
-                    f'style="width:{w}px;height:{h}px;max-width:none;'
-                    f'vertical-align:-3px;border:none;margin:0 2px;">'
-                )
-            else:
-                img_tag = f'<code>{escape(latex_content)}</code>'
+            img_tag = "".join(rendered_parts)
 
         html = html.replace(key, img_tag)
 
