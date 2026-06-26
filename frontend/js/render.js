@@ -32,13 +32,13 @@ function _stashFormulas(mdText) {
   });
 
   // 2. Stash $$...$$ (must run before $ → to avoid consuming individual $ chars of $$)
-  text = text.replace(/\$\$([\s\S]*?)\$\$/g, function (_, f) {
-    return stash("\\[" + f + "\\]");
+  text = text.replace(/(^|[^\\])\$\$([\s\S]*?)\$\$/g, function (_, prefix, f) {
+    return prefix + stash("\\[" + f + "\\]");
   });
 
-  // 3. Stash $...$ (inline math — non-greedy to pair nearest closing $)
-  text = text.replace(/\$([\s\S]+?)\$/g, function (_, f) {
-    return stash("\\(" + f + "\\)");
+  // 3. Stash $...$ (inline math, not escaped dollars and not across lines)
+  text = text.replace(/(^|[^\\$])\$(?!\$)((?:\\.|[^\n\\$])+?)\$(?!\$)/g, function (_, prefix, f) {
+    return prefix + stash("\\(" + f + "\\)");
   });
 
   return { text: text, formulas: formulas };

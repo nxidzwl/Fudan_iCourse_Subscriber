@@ -2,6 +2,7 @@ import re
 import smtplib
 import time
 import uuid
+from base64 import b64encode
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from io import BytesIO
@@ -153,7 +154,8 @@ def _prefetch_latex_images(urls: list[str], dpi: int = 300) -> None:
             future.result()  # trigger any exception logging inside _fetch_latex_image
 
 
-def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
+def _md_to_html(md_text: str, cid_images: dict | None = None,
+                embed_images: bool = False) -> str:
     """Convert Markdown to styled HTML, rendering LaTeX math as images.
 
     Processing order: extract LaTeX → markdown convert → restore as <img>.
@@ -165,40 +167,46 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
                     references instead of external URLs.  The dict is populated
                     with {cid_name: png_bytes} entries for the caller to attach
                     to the MIME message.
+        embed_images: When True, embed rendered LaTeX PNGs as data URIs.  This
+                      is used for PDF generation so WeasyPrint does not need to
+                      fetch remote formula images while rendering the document.
     """
     latex_map: dict[str, str] = {}
     counter = 0
 
-    def _stash(match):
+    def _stash_latex(value: str) -> str:
         nonlocal counter
         key = f"\x00LATEX{counter}\x00"
         counter += 1
-        latex_map[key] = match.group(0)
+        latex_map[key] = value
         return key
+
+    def _stash(match):
+        return _stash_latex(match.group(0))
+
+    def _stash_dollar_block(match):
+        return match.group(1) + _stash_latex("$$" + match.group(2) + "$$")
+
+    def _stash_dollar_inline(match):
+        return match.group(1) + _stash_latex("$" + match.group(2) + "$")
 
     def _stash_block(match):
         """Stash \\[...\\] as $$...$$ for uniform downstream handling."""
-        nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
-        counter += 1
-        latex_map[key] = "$$" + match.group(1) + "$$"
-        return key
+        return _stash_latex("$$" + match.group(1) + "$$")
 
     def _stash_inline(match):
         """Stash \\(...\\) as $...$ for uniform downstream handling."""
-        nonlocal counter
-        key = f"\x00LATEX{counter}\x00"
-        counter += 1
-        latex_map[key] = "$" + match.group(1) + "$"
-        return key
+        return _stash_latex("$" + match.group(1) + "$")
 
     # Extract LaTeX in order: block first, then inline
     # 1) $$...$$ block formulas
-    text = re.sub(r"\$\$(.+?)\$\$", _stash, md_text, flags=re.DOTALL)
+    text = re.sub(r"(^|[^\\])\$\$(.+?)\$\$", _stash_dollar_block,
+                  md_text, flags=re.DOTALL)
     # 2) \[...\] block formulas (normalize to $$...$$)
     text = re.sub(r"\\\[(.+?)\\\]", _stash_block, text, flags=re.DOTALL)
     # 3) $...$ inline formulas (not $$)
-    text = re.sub(r"(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)", _stash, text)
+    text = re.sub(r"(^|[^\\$])\$(?!\$)((?:\\.|[^\n\\$])+?)\$(?!\$)",
+                  _stash_dollar_inline, text)
     # 4) \(...\) inline formulas (normalize to $...$)
     text = re.sub(r"\\\((.+?)\\\)", _stash_inline, text)
 
@@ -225,7 +233,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
 
         if is_block:
             if w and h:
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(url, img_data, cid_images, embed_images)
                 img_tag = (
                     f'<div style="text-align:center;margin:16px 0">'
                     f'<img src="{src}" alt="{escape(latex_content)}" '
@@ -247,7 +255,7 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
                     w = max(1, int(w * scale))
                     h = _MIN_INLINE_HEIGHT
 
-                src = _resolve_src(url, img_data, cid_images)
+                src = _resolve_src(url, img_data, cid_images, embed_images)
                 img_tag = (
                     f'<img src="{src}" alt="{escape(latex_content)}" '
                     f'width="{w}" height="{h}" '
@@ -263,8 +271,11 @@ def _md_to_html(md_text: str, cid_images: dict | None = None) -> str:
 
 
 def _resolve_src(url: str, img_data: bytes | None,
-                 cid_images: dict | None) -> str:
+                 cid_images: dict | None, embed_images: bool = False) -> str:
     """Return a CID reference if embedding, otherwise the original URL."""
+    if embed_images and img_data:
+        encoded = b64encode(img_data).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
     if cid_images is not None and img_data:
         cid = f"latex-{uuid.uuid4().hex[:12]}"
         cid_images[cid] = img_data
